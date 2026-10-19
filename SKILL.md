@@ -161,7 +161,8 @@ python3 "$SUMMARY_PATH" \
 | `--detail` | 开启（默认） | 抓取详情页 JD |
 | `--no-detail` | - | 不抓取详情页（关闭默认行为） |
 | `--max-details` | 全部 | 详情页数量上限 |
-| `--analysis` | 关闭 | 输出分析报告 |
+| `--analysis` | 关闭 | 输出分析报告：终端打印 + 写 Markdown 报告（`结果目录/boss_report_<时间>.md`），岗位名跳转职位页、公司名跳转公司页 |
+| `--report-output FILE` | `结果目录/boss_report_<时间>.md` | 指定 Markdown 分析报告路径 |
 | `--allow-dom-fallback` | 关闭 | API 无数据时允许降级 DOM 提取；默认关闭，薪资可能不可信 |
 | `--merge FILE` | - | 合并已有 JSON（按 job_id 去重） |
 | `--cdp-port` | 9222 | CDP 端口 |
@@ -240,7 +241,7 @@ python3 "$SUMMARY_PATH" \
 
 `--setup-chrome` 默认使用持久隔离 profile，不软链接、不读取、不复制主 Chrome profile。首次启动和后续重复启动都只会创建或复用 `~/.boss-zhipin-scraper/chrome-profile`，不会清空其中的 BOSS 登录态。setup 会等待登录完成，并用多组关键词/城市 probe，要求搜索接口返回明文薪资；如果一直拿不到 `salaryDesc`，不要继续抓取并把 DOM 薪资当成可信数据。这样 CDP 只暴露 BOSS 专用浏览器里的数据，不影响用户主 Chrome、Gmail、GitHub 等账号。
 
-`--input ... --analysis --no-detail` 会优先加载 `--detail-output`，其次加载与输入列表同目录、同时间戳的 `boss_details_*.json`，最后查找 `~/.boss-zhipin-scraper/job-result` 下最新详情文件。
+`--input ... --analysis --no-detail` 会优先加载 `--detail-output`，其次加载与输入列表同目录、同时间戳的 `boss_details_*.json`，最后查找 `~/.boss-zhipin-scraper/job-result` 下最新详情文件。这条路径不启动浏览器，可随时用已有数据补一份 Markdown 分析报告。
 
 需要清空 BOSS 专用浏览器登录态时使用：
 

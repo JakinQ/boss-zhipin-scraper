@@ -36,6 +36,20 @@ def load_module():
     return module
 
 
+def fake_requests_module():
+    """构造 requests 替身，兼容 cdp_http_request 的 Session(trust_env=False) 用法。
+
+    脚本访问本机 CDP 时走独立 Session（绕开系统代理），因此替身必须同时提供
+    Session().get 和模块级 get；两者指向同一个 Mock，测试里设置的
+    return_value / side_effect 对两条路径都生效。
+    """
+    fake = mock.Mock()
+    session = mock.Mock()
+    session.get = fake.get
+    fake.Session.return_value = session
+    return fake
+
+
 class ChromeSetupTests(unittest.TestCase):
     def test_default_cdp_profile_is_persistent_and_not_default_or_tmp(self):
         module = load_module()
@@ -478,16 +492,50 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIs(server_error.status, module.LoginProbeStatus.RESPONSE_ERROR)
         self.assertTrue(server_error.retryable)
 
+    def test_cdp_http_get_bypasses_system_proxy(self):
+        """本机 CDP 请求必须绕开 http_proxy，否则代理的 502 会伪装成 JSON 解析错误。"""
+        module = load_module()
+        response = mock.Mock()
+        response.status_code = 200
+        response.json.return_value = {"Browser": "Chrome/140"}
+        fake = fake_requests_module()
+        fake.get.return_value = response
+
+        with mock.patch.object(module, "requests", fake):
+            version = module.cdp_http_get("/json/version", cdp_port=9333)
+
+        self.assertEqual(version, {"Browser": "Chrome/140"})
+        session = fake.Session.return_value
+        self.assertFalse(session.trust_env)
+        self.assertEqual(fake.get.call_args.args[0], "http://127.0.0.1:9333/json/version")
+
+    def test_cdp_http_get_reports_non_json_response(self):
+        """代理/网关返回纯文本时应报 CDP 不可用，而不是 JSONDecodeError 回溯。"""
+        module = load_module()
+        response = mock.Mock()
+        response.status_code = 200
+        response.text = "upstream connect failed"
+        response.json.side_effect = json.JSONDecodeError("Expecting value", "", 0)
+        fake = fake_requests_module()
+        fake.get.return_value = response
+
+        with mock.patch.object(module, "requests", fake):
+            with self.assertRaises(module.CDPUnavailableError) as ctx:
+                module.cdp_http_get("/json/version", cdp_port=9333)
+
+        self.assertIn("非 JSON", str(ctx.exception))
+
     def test_run_check_reports_restriction_instead_of_logged_out(self):
         module = load_module()
         response = mock.Mock()
+        response.status_code = 200
         response.json.return_value = {"Browser": "Chrome/140"}
         restricted = module.LoginProbeResult(
             module.LoginProbeStatus.RESTRICTED,
             code=31,
             message="访问受限",
         )
-        requests_mock = mock.Mock()
+        requests_mock = fake_requests_module()
         requests_mock.get.return_value = response
         stdout = io.StringIO()
         with mock.patch.object(module, "require_runtime_dependencies", return_value=True), \
@@ -1414,7 +1462,7 @@ class ChromeSetupTests(unittest.TestCase):
     def test_setup_defaults_do_not_copy_cookies_or_kill_all_chrome(self):
         module = load_module()
         calls = {"copy2": [], "run": [], "popen": []}
-        fake_requests = mock.Mock()
+        fake_requests = fake_requests_module()
         responses = iter([
             Exception("not ready"),
             type("Resp", (), {"status_code": 200})(),
@@ -1450,7 +1498,7 @@ class ChromeSetupTests(unittest.TestCase):
     def test_setup_edge_uses_edge_executable_and_profile_source(self):
         module = load_module()
         calls = {"run": [], "popen": []}
-        fake_requests = mock.Mock()
+        fake_requests = fake_requests_module()
         responses = iter([
             Exception("not ready"),
             type("Resp", (), {"status_code": 200})(),
@@ -1501,7 +1549,7 @@ class ChromeSetupTests(unittest.TestCase):
 
     def test_setup_rejects_ready_cdp_port_owned_by_other_profile(self):
         module = load_module()
-        fake_requests = mock.Mock()
+        fake_requests = fake_requests_module()
         fake_requests.get.return_value = type("Resp", (), {"status_code": 200})()
 
         with tempfile_profile() as paths:
@@ -1519,7 +1567,7 @@ class ChromeSetupTests(unittest.TestCase):
 
     def test_setup_reuses_ready_cdp_port_owned_by_dedicated_profile(self):
         module = load_module()
-        fake_requests = mock.Mock()
+        fake_requests = fake_requests_module()
         fake_requests.get.return_value = type("Resp", (), {"status_code": 200})()
 
         with tempfile_profile() as paths:
@@ -1539,7 +1587,7 @@ class ChromeSetupTests(unittest.TestCase):
 
     def test_setup_can_skip_waiting_for_login(self):
         module = load_module()
-        fake_requests = mock.Mock()
+        fake_requests = fake_requests_module()
         fake_requests.get.return_value = type("Resp", (), {"status_code": 200})()
 
         with tempfile_profile() as paths:
@@ -1612,7 +1660,7 @@ class ChromeSetupTests(unittest.TestCase):
     def test_setup_edge_rejects_ready_cdp_port_served_by_chrome(self):
         """隔离 profile 已由 Chrome 服务时，--setup-edge 必须报错而不是静默复用。"""
         module = load_module()
-        fake_requests = mock.Mock()
+        fake_requests = fake_requests_module()
         fake_requests.get.return_value = type("Resp", (), {"status_code": 200})()
 
         with tempfile_profile() as paths:
@@ -1879,6 +1927,90 @@ def _normalize_version(raw):
     major = parts[0] if len(parts) > 0 else "0"
     minor = parts[1] if len(parts) > 1 else "0"
     return f"{major}.{minor}"
+
+
+class MarkdownReportTests(unittest.TestCase):
+    """--analysis 的 Markdown 报告：必须落盘、公司名和岗位名都要可点击。"""
+
+    def _list_data(self):
+        return {
+            "keyword": "前端",
+            "city": "广州",
+            "scraped_at": "2026-10-19T14:21:00",
+            "jobs": [
+                {
+                    "title": "前端开发工程师",
+                    "salary": "8-13K",
+                    "location": "广州·天河区·棠下",
+                    "tags": "3-5年 | 本科",
+                    "boss_name": "比特鹰",
+                    "boss_active_status": "在线",
+                    "job_link": "https://www.zhipin.com/job_detail/a.html",
+                    "company_link": "https://www.zhipin.com/gongsi/b.html",
+                    "job_id": "1",
+                    "is_new": True,
+                },
+                {
+                    "title": "前端开发实习生",
+                    "salary": "150-200元/天",
+                    "location": "广州·越秀区·人民北路",
+                    "tags": "在校/应届 | 本科",
+                    "boss_name": "未知公司",
+                    "job_id": "2",
+                    "is_new": False,
+                },
+            ],
+        }
+
+    def test_analyze_writes_report_with_clickable_links(self):
+        module = load_module()
+        list_data = self._list_data()
+        details = [
+            {"job_id": "1", "jd": "负责前端页面开发", "skill_tags": ["React", "Vue"]},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            report_path = os.path.join(tmp, "report.md")
+            with redirect_stdout(io.StringIO()):
+                result = module.analyze(
+                    list_data, details, search_keyword="前端",
+                    report_path=report_path,
+                )
+            self.assertEqual(result, report_path)
+            self.assertTrue(os.path.exists(report_path))
+            with open(report_path, encoding="utf-8") as f:
+                content = f.read()
+
+        # 岗位名 → 职位页，公司名 → 公司页
+        self.assertIn("[前端开发工程师](https://www.zhipin.com/job_detail/a.html)", content)
+        self.assertIn("[比特鹰](https://www.zhipin.com/gongsi/b.html)", content)
+        # 完全没有链接的岗位退化为纯文本，而不是生成一个空的 []() 链接
+        self.assertIn("| 未知公司 |", content)
+        self.assertNotIn("[未知公司]", content)
+        # 分布统计 + 清单 action 行
+        self.assertIn("## 一、薪资分布", content)
+        self.assertIn("¥", content)  # 月薪中位数
+        self.assertIn("| # | 岗位 | 公司 | 薪资 | 地点 | 经验/学历 | 活跃 | JD |", content)
+        self.assertIn("🆕", content)
+
+    def test_report_marks_missing_detail_and_escapes_pipes(self):
+        module = load_module()
+        list_data = self._list_data()
+        list_data["jobs"][0]["tags"] = "3-5年 | 本科 | A｜B"
+        report = module.build_markdown_report(list_data, [], search_keyword="前端")
+        # 无详情时 JD 列标记为缺失
+        self.assertIn("| — |", report)
+        # 竖线转义后不会破坏表格结构
+        self.assertIn("3-5年 \\| 本科", report)
+        self.assertNotIn("本科 | A｜B |", report)
+
+    def test_report_defaults_into_result_dir(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(module, "DEFAULT_RESULT_DIR", str(tmp)):
+                path = module.default_report_path()
+        self.assertTrue(path.startswith(tmp))
+        self.assertTrue(path.endswith(".md"))
+        self.assertIn("boss_report_", os.path.basename(path))
 
 
 class VersionConsistencyTests(unittest.TestCase):

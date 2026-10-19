@@ -181,7 +181,8 @@ python3 scripts/job_summary.py --top 15
 | `--format` | json / csv; csv also exports list and detail CSVs |
 | `--detail` | Scrape detail-page JD (on by default) |
 | `--no-detail` | Do not scrape detail pages |
-| `--analysis` | Analysis report |
+| `--analysis` | Analysis report (printed to the terminal + written as a Markdown file in the result directory, with clickable job/company links) |
+| `--report-output FILE` | Path for the Markdown report (defaults to `<result-dir>/boss_report_<timestamp>.md`) |
 | `--merge FILE` | Merge existing data (deduped by job_id) |
 | `--diff-base FILE` | Explicit baseline file for `is_new` (defaults to the most recent prior result with the same keyword and city whose filename date is before today; with no baseline, all jobs are treated as new) |
 | `--allow-dom-fallback` | Allow DOM extraction fallback when the API has no data; off by default, salaries may be unreliable |
@@ -260,7 +261,7 @@ DOM extraction is not used for the list by default, since DOM salaries may be hi
 
 For detail pages, the scraper only extracts a section containing the job-description heading. Full-page `body` text is diagnostic input for detecting login walls and navigation shells and is never written directly as a JD. If the page contains the login-to-view-full-content marker, the crawl fails explicitly and stops before truncated text, recruiter metadata, company sections, or recommended jobs can be saved as a complete JD.
 
-`--input ... --analysis --no-detail` first loads `--detail-output`, then the `boss_details_*.json` with the same timestamp in the same dir as the input list, and finally the newest detail file under `~/.boss-zhipin-scraper/job-result`.
+`--input ... --analysis --no-detail` first loads `--detail-output`, then the `boss_details_*.json` with the same timestamp in the same dir as the input list, and finally the newest detail file under `~/.boss-zhipin-scraper/job-result`. This path never starts Chrome, so you can regenerate the Markdown report from existing data at any time.
 
 ## Browser Profile Security Policy
 

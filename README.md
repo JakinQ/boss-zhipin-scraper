@@ -183,7 +183,8 @@ python3 scripts/job_summary.py --top 15
 | `--format` | json / csv；csv 会同时导出列表和详情 CSV |
 | `--detail` | 抓取详情页 JD（默认开启） |
 | `--no-detail` | 不抓取详情页 |
-| `--analysis` | 分析报告 |
+| `--analysis` | 分析报告（终端打印 + 写一份 Markdown 到结果目录，岗位名/公司名可点击跳转） |
+| `--report-output FILE` | 指定 Markdown 分析报告路径（默认 `结果目录/boss_report_<时间>.md`） |
 | `--merge FILE` | 合并已有数据（按 job_id 去重） |
 | `--diff-base FILE` | 指定 `is_new` 对比基准文件（默认自动取同关键词同城市、文件名日期早于本轮的最近一份结果；无基准时全体视为新增） |
 | `--allow-dom-fallback` | API 无数据时允许降级 DOM 提取；默认关闭，薪资可能不可信 |
@@ -261,7 +262,7 @@ boss-zhipin-scraper/
 
 详情页只从包含“职位描述”的详情区提取 JD，整页 `body` 仅用于识别登录墙和导航页，不会直接写入结果。若页面出现“登录查看完整内容”，抓取会明确报错并停止，避免把截断正文、招聘者信息、公司介绍和推荐职位当成完整 JD 保存。
 
-`--input ... --analysis --no-detail` 会优先加载 `--detail-output`，其次加载与输入列表同目录、同时间戳的 `boss_details_*.json`，最后查找 `~/.boss-zhipin-scraper/job-result` 下最新详情文件。
+`--input ... --analysis --no-detail` 会优先加载 `--detail-output`，其次加载与输入列表同目录、同时间戳的 `boss_details_*.json`，最后查找 `~/.boss-zhipin-scraper/job-result` 下最新详情文件。这条路径不启动 Chrome，可随时用已有数据补一份 Markdown 分析报告。
 
 ## 浏览器 profile 安全策略
 

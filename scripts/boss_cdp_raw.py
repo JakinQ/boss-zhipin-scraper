@@ -364,14 +364,70 @@ def incr_request():
 # ============================================================
 # CDP 连接
 # ============================================================
+class CDPUnavailableError(RuntimeError):
+    """CDP 端口不可用（Chrome 未启动、端口被占用或请求被代理拦截）。"""
+
+
+def cdp_http_request(path, cdp_port=DEFAULT_CDP_PORT, timeout=10):
+    """向本机 CDP 的 HTTP 接口发 GET 请求，返回原始响应。
+
+    强制绕过系统代理：当环境里存在 http_proxy/HTTP_PROXY（Clash、公司代理、
+    容器网络等）时，requests 会把发往 127.0.0.1 的请求也交给代理，代理返回
+    502 纯文本，resp.json() 抛 JSONDecodeError，报错信息完全误导用户。
+    本机回环请求不应该走代理，因此用 trust_env=False 的独立 Session。
+    """
+    url = f"http://127.0.0.1:{cdp_port}{path}"
+    session = requests.Session()
+    session.trust_env = False
+    try:
+        return session.get(url, timeout=timeout)
+    finally:
+        session.close()
+
+
+def cdp_http_get(path, cdp_port=DEFAULT_CDP_PORT, timeout=10):
+    """访问本机 CDP 的 HTTP 接口并解析 JSON（非 200 / 非 JSON 抛 CDPUnavailableError）。"""
+    url = f"http://127.0.0.1:{cdp_port}{path}"
+    resp = cdp_http_request(path, cdp_port, timeout)
+    if resp.status_code != 200:
+        raise CDPUnavailableError(f"CDP 接口 {url} 返回 HTTP {resp.status_code}")
+    try:
+        return resp.json()
+    except json.JSONDecodeError as e:
+        body = (resp.text or "").strip().replace("\n", " ")[:120]
+        raise CDPUnavailableError(
+            f"CDP 接口 {url} 返回非 JSON 内容（{body}）"
+        ) from e
+
+
+def describe_cdp_unavailable(cdp_port=DEFAULT_CDP_PORT):
+    """CDP 连接失败时给用户的排查指引。"""
+    return (
+        f"无法连接 Chrome CDP 端口 127.0.0.1:{cdp_port}\n"
+        f"请先启动带调试端口的 Chrome：python {__file__} --setup-chrome\n"
+        f"（启动后在该 Chrome 窗口登录 BOSS直聘，再在另一个终端重跑抓取命令）\n"
+        f"若已启动仍报错，检查端口是否被占用：--cdp-port 指定其它端口"
+    )
+
+
 class CDPSession:
     def __init__(self, cdp_port=DEFAULT_CDP_PORT):
         if not require_runtime_dependencies("requests", "websocket"):
             raise RuntimeError("缺少 CDP 运行依赖")
         self.cdp_port = cdp_port
-        resp = requests.get(f"http://127.0.0.1:{cdp_port}/json/version", timeout=10)
-        ws_url = resp.json()["webSocketDebuggerUrl"]
-        self.ws = websocket.create_connection(ws_url, timeout=60)
+        try:
+            version = cdp_http_get("/json/version", cdp_port, timeout=10)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            raise CDPUnavailableError(describe_cdp_unavailable(cdp_port)) from e
+        ws_url = version.get("webSocketDebuggerUrl")
+        if not ws_url:
+            raise CDPUnavailableError(
+                f"CDP 响应缺少 webSocketDebuggerUrl：{version}"
+            )
+        try:
+            self.ws = websocket.create_connection(ws_url, timeout=60)
+        except websocket.WebSocketException as e:
+            raise CDPUnavailableError(describe_cdp_unavailable(cdp_port)) from e
         self.mid = 0
         # CDP 事件缓冲：send() 等待命令响应期间到达的事件通知都会存这里，
         # 供 Network 域被动捕获使用（见 NetworkJoblistCapture）。
@@ -483,11 +539,15 @@ def create_page_session(cdp, background=True):
     before callers navigate. Interactive callers such as the login flow must
     opt into a foreground target explicitly.
     """
-    target = cdp.send(
+    resp = cdp.send(
         "Target.createTarget",
         {"url": "about:blank", "background": background},
     )
-    target_id = target["result"]["targetId"]
+    if "result" not in resp:
+        # CDP 错误响应形如 {"id":N,"error":{"code":...,"message":"..."}}；
+        # 直接取 ["result"] 只会抛 KeyError，把真正的失败原因吞掉。
+        raise RuntimeError(f"Target.createTarget 失败: {resp.get('error') or resp}")
+    target_id = resp["result"]["targetId"]
     attached = cdp.send(
         "Target.attachToTarget",
         {"targetId": target_id, "flatten": True},
@@ -512,6 +572,38 @@ def create_page_session(cdp, background=True):
             session_id,
         )
     return target_id, session_id
+
+
+def open_detail_page(cdp_port, attempts=3):
+    """为详情页建立一次会话（新连接 + 后台标签页），失败时换新连接重试。
+
+    Chrome 偶发对 Target.createTarget 返回 "Failed to open a new tab" 并随即
+    关闭浏览器级 WebSocket。此时在同一个连接上重试毫无意义（socket 已关闭），
+    必须重建连接，否则一次抖动会让整轮详情抓取崩掉。
+    """
+    last_error = None
+    for attempt in range(attempts):
+        cdp = None
+        try:
+            cdp = CDPSession(cdp_port)
+            tid, sid = create_page_session(cdp)
+            return cdp, tid, sid
+        except (CDPUnavailableError, RuntimeError, OSError,
+                websocket.WebSocketException, TimeoutError) as e:
+            last_error = e
+            if cdp is not None:
+                try:
+                    cdp.close()
+                except (websocket.WebSocketException, OSError):
+                    pass
+            if attempt + 1 < attempts:
+                wait = 2 * (attempt + 1)
+                print(f"  ⚠️ 新建详情页失败（{e}），{wait}s 后重连重试...")
+                time.sleep(wait)
+
+    raise CDPUnavailableError(
+        f"无法创建详情页标签（已重试 {attempts} 次）: {last_error}"
+    )
 
 
 # ============================================================
@@ -1370,6 +1462,24 @@ def _atomic_write_json(path, payload):
                 pass
 
 
+def _atomic_write_text(path, text):
+    """文本版原子写入（Markdown 报告用），避免中断留下半截文件。"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp_path = f"{path}.tmp{os.getpid()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 def flush_jobs(path, meta, jobs):
     """每次有新数据就全量刷写（jobs 去重后），保证异常退出也能保留"""
     existing_jobs = []
@@ -1915,8 +2025,13 @@ def scrape_details(list_data, max_details=None, output_path=None,
         incr_request()
 
         # 每个详情页用新 session 避免检测；自动化 target 默认后台创建。
-        ws = CDPSession(cdp_port)
-        tid, sid = create_page_session(ws)
+        # 建页失败会重连重试，仍失败则中止详情（已抓详情和列表数据都保留）。
+        try:
+            ws, tid, sid = open_detail_page(cdp_port)
+        except CDPUnavailableError as e:
+            print(f"  ⚠️ {e}")
+            print("  ⚠️ 详情抓取提前结束，已抓到的详情会保留，列表数据不受影响\n")
+            break
 
         detail_url = build_detail_url(job)
         ws.send("Page.navigate", {"url": detail_url}, sid)
@@ -2079,8 +2194,256 @@ def extract_tech_terms_from_jds(details, search_keyword=""):
 # ============================================================
 # 分析报告
 # ============================================================
-def analyze(list_data, details=None, search_keyword=""):
+SALARY_MONTHLY_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*([Kk]|元/天)")
+
+
+def default_report_path():
+    filename = f"boss_report_{datetime.now().strftime('%Y%m%d_%H%M')}.md"
+    return os.path.join(DEFAULT_RESULT_DIR, filename)
+
+
+def parse_salary_mid_monthly(salary):
+    """把 "8-13K" / "150-200元/天" 折算成月薪中位数（元），解析不了返回 None。"""
+    match = SALARY_MONTHLY_RE.search(str(salary or ""))
+    if not match:
+        return None
+    low, high = float(match.group(1)), float(match.group(2))
+    mid = (low + high) / 2
+    return mid * 1000 if match.group(3).lower() == "k" else mid * 21.75
+
+
+def compute_analysis_stats(jobs, details=None, search_keyword=""):
+    """终端报告与 Markdown 报告共用的统计口径，避免两处各算一套导致数字打架。"""
+    salary_ranges = Counter()
+    exp_count = Counter()
+    edu_count = Counter()
+    loc_count = Counter()
+    company_count = Counter()
+    skill_freq = Counter()
+    body_freq = Counter()
+    salary_mids = []
+
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+
+        salary = str(job.get("salary") or "").strip()
+        if "K" in salary or "元/天" in salary:
+            salary_ranges[salary] += 1
+            mid = parse_salary_mid_monthly(salary)
+            if mid:
+                salary_mids.append(mid)
+        else:
+            salary_ranges["未标注"] += 1
+
+        for tag in str(job.get("tags") or "").split(" | "):
+            if "年" in tag or "应届" in tag or "在校" in tag or "经验不限" in tag:
+                exp_count[tag] += 1
+            elif tag in ("大专", "本科", "硕士", "博士", "学历不限"):
+                edu_count[tag] += 1
+
+        # "广州·天河区·棠下" 取区县；"广州··" 这类缺区县的回落取城市名
+        parts = [part for part in str(job.get("location") or "").split("·") if part]
+        if parts:
+            loc_count[parts[1] if len(parts) > 1 else parts[0]] += 1
+
+        company = str(job.get("boss_name") or "").strip()
+        if company:
+            company_count[company] += 1
+
+    if details:
+        for detail in details:
+            for tag in detail.get("skill_tags") or []:
+                skill_freq[tag] += 1
+        tech_terms = extract_tech_terms_from_jds(details, search_keyword)
+        for detail in details:
+            jd_lower = str(detail.get("jd") or "").lower()
+            for term in tech_terms:
+                if term.lower() in jd_lower:
+                    body_freq[term] += 1
+
+    salary_mids.sort()
+    median = salary_mids[len(salary_mids) // 2] if salary_mids else None
+
+    return {
+        "salary_ranges": salary_ranges,
+        "exp_count": exp_count,
+        "edu_count": edu_count,
+        "loc_count": loc_count,
+        "company_count": company_count,
+        "skill_freq": skill_freq,
+        "body_freq": body_freq,
+        "salary_priced": len(salary_mids),
+        "salary_median": median,
+    }
+
+
+def _md_cell(value):
+    """表格单元格转义：竖线会截断 Markdown 表格，换行会破坏行结构。"""
+    return str(value if value is not None else "").replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _md_link(text, url):
+    """生成可点击链接；没有合法 URL 时退回纯文本。"""
+    label = _md_cell(text) or "—"
+    url = str(url or "").strip()
+    if not url.startswith("http"):
+        return label
+    return f"[{label}]({url})"
+
+
+def _md_table(headers, rows):
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(str(cell) for cell in row) + " |")
+    return lines
+
+
+def build_markdown_report(list_data, details=None, search_keyword="", stats=None):
+    """生成 Markdown 分析报告：概览 + 分布统计 + 可点击的岗位清单。"""
+    jobs = [job for job in list_data.get("jobs", []) if isinstance(job, dict)]
+    details = [detail for detail in (details or []) if isinstance(detail, dict)]
+    keyword = list_data.get("keyword") or search_keyword or ""
+    city = list_data.get("city") or ""
+    stats = stats or compute_analysis_stats(jobs, details, search_keyword or keyword)
+    total = len(jobs)
+    new_total = sum(1 for job in jobs if job.get("is_new"))
+    detail_ids = {detail.get("job_id") for detail in details}
+
+    scraped_at = str(list_data.get("scraped_at") or "").replace("T", " ")[:16]
+    title = " ".join(part for part in (keyword, city) if part) or "岗位"
+
+    lines = [f"# {title} 岗位分析报告", ""]
+    lines.append(
+        f"> 抓取时间：{scraped_at or datetime.now().strftime('%Y-%m-%d %H:%M')} ｜ "
+        f"列表岗位 {total} 条 ｜ 详情 JD {len(details)} 条 ｜ 本轮新增 {new_total} 条"
+    )
+    lines.append("")
+    if stats["salary_median"]:
+        lines.append(
+            f"- 有明确薪资 {stats['salary_priced']} 条，月薪中位数约 "
+            f"¥{stats['salary_median']:,.0f}（日薪按 21.75 天折算）"
+        )
+        lines.append("")
+
+    lines += ["## 一、薪资分布", ""]
+    rows = []
+    for salary, count in stats["salary_ranges"].most_common(15):
+        pct = count / total * 100 if total else 0
+        rows.append([_md_cell(salary), count, f"{pct:.0f}%", "█" * count])
+    lines += _md_table(["薪资区间", "岗位数", "占比", "分布"], rows) if rows else ["暂无数据"]
+    lines.append("")
+
+    lines += ["## 二、经验与学历", ""]
+    for heading, counter in (("经验要求", stats["exp_count"]), ("学历要求", stats["edu_count"])):
+        lines += [f"### {heading}", ""]
+        rows = [
+            [_md_cell(name), count, f"{count / total * 100:.0f}%" if total else "0%"]
+            for name, count in counter.most_common()
+        ]
+        lines += _md_table(["要求", "岗位数", "占比"], rows) if rows else ["暂无数据"]
+        lines.append("")
+
+    lines += ["## 三、地区分布", ""]
+    rows = [
+        [_md_cell(name), count, f"{count / total * 100:.0f}%" if total else "0%"]
+        for name, count in stats["loc_count"].most_common(15)
+    ]
+    lines += _md_table(["区县", "岗位数", "占比"], rows) if rows else ["暂无数据"]
+    lines.append("")
+
+    lines += ["## 四、高频公司", ""]
+    company_links = {}
+    for job in jobs:
+        name = str(job.get("boss_name") or "").strip()
+        if name and name not in company_links:
+            company_links[name] = job.get("company_link") or job.get("job_link") or ""
+    rows = [
+        [_md_link(name, company_links.get(name)), count]
+        for name, count in stats["company_count"].most_common(15)
+    ]
+    lines += _md_table(["公司", "在招岗位数"], rows) if rows else ["暂无数据"]
+    lines.append("")
+
+    if details:
+        lines += ["## 五、技能要求", ""]
+        lines += ["### JD 技能标签", ""]
+        rows = [
+            [_md_cell(name), count, f"{count / len(details) * 100:.0f}%"]
+            for name, count in stats["skill_freq"].most_common(25)
+        ]
+        lines += _md_table(["技能标签", "出现次数", "覆盖 JD"], rows) if rows else ["暂无数据"]
+        lines.append("")
+        lines += ["### JD 正文高频技术词", ""]
+        rows = [
+            [_md_cell(term), count, f"{count / len(details) * 100:.0f}%"]
+            for term, count in stats["body_freq"].most_common(25)
+        ]
+        lines += _md_table(["技术词", "出现次数", "覆盖 JD"], rows) if rows else ["暂无数据"]
+        lines.append("")
+
+    lines += ["## 六、岗位清单", ""]
+    lines.append("> 点击岗位名跳转 BOSS 直聘职位页，点击公司名跳转公司主页。")
+    lines.append("")
+    rows = []
+    for index, job in enumerate(jobs, 1):
+        title_cell = _md_link(job.get("title") or "", job.get("job_link") or "")
+        if job.get("is_new"):
+            title_cell = f"🆕 {title_cell}"
+        company_cell = _md_link(
+            job.get("boss_name") or "",
+            job.get("company_link") or job.get("job_link") or "",
+        )
+        rows.append([
+            index,
+            title_cell,
+            company_cell,
+            _md_cell(job.get("salary")) or "未标注",
+            _md_cell(job.get("location")),
+            _md_cell(job.get("tags")),
+            _md_cell(job.get("boss_active_status")) or "—",
+            "✅" if job.get("job_id") in detail_ids else "—",
+        ])
+    headers = ["#", "岗位", "公司", "薪资", "地点", "经验/学历", "活跃", "JD"]
+    lines += _md_table(headers, rows) if rows else ["暂无数据"]
+    lines.append("")
+
+    lines += ["## 七、简历建议", ""]
+    body_freq = stats["body_freq"]
+    if details and body_freq:
+        noise_list = {"BOSS直聘", "boss", "BOSS", "来自BOSS直聘", "金", "金币"}
+        top_skills = [name for name, _ in stats["skill_freq"].most_common(10)]
+        valid_skills = [s for s in top_skills if len(s) >= 2 and s not in noise_list]
+        if len(valid_skills) < 3:
+            top_skills = [term for term, _ in body_freq.most_common(10)]
+        top_body = [term for term, _ in body_freq.most_common(8)]
+        lines.append(f"- 技能关键词：{', '.join(top_skills) or '暂无'}")
+        lines.append(f"- 正文高频词：{', '.join(top_body) or '暂无'}")
+        if stats["exp_count"]:
+            lines.append(f"- 经验要求主流：{stats['exp_count'].most_common(1)[0][0]}")
+        if stats["edu_count"]:
+            lines.append(f"- 学历要求主流：{stats['edu_count'].most_common(1)[0][0]}")
+    else:
+        lines.append("提示：用 `--detail` 抓取 JD 详情后可获得更精准的简历建议")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def analyze(list_data, details=None, search_keyword="", report_path=None):
     jobs = list_data.get("jobs", [])
+    stats = compute_analysis_stats(jobs, details, search_keyword)
+    salary_ranges = stats["salary_ranges"]
+    exp_count = stats["exp_count"]
+    edu_count = stats["edu_count"]
+    loc_count = stats["loc_count"]
+    company_count = stats["company_count"]
+    skill_freq = stats["skill_freq"]
+    body_freq = stats["body_freq"]
+
     print(f"\n{'='*60}")
     print(f"  分析报告: {list_data.get('keyword','')} @ {list_data.get('city','')}")
     print(f"  共 {len(jobs)} 条职位")
@@ -2088,85 +2451,39 @@ def analyze(list_data, details=None, search_keyword=""):
 
     # 1. 薪资分析
     print(f"\n--- 薪资分布 ---")
-    salary_ranges = Counter()
-    for j in jobs:
-        s = j.get("salary", "")
-        if "K" in s:
-            salary_ranges[s] += 1
-        elif "元/天" in s:
-            salary_ranges[s] += 1
-        else:
-            salary_ranges["未标注"] += 1
     for s, c in salary_ranges.most_common(15):
         bar = "█" * c
         print(f"  {s:<20} {c:>3}  {bar}")
 
     # 2. 经验要求
     print(f"\n--- 经验要求 ---")
-    exp_count = Counter()
-    for j in jobs:
-        tags = j.get("tags", "")
-        for t in tags.split(" | "):
-            if "年" in t or "应届" in t or "在校" in t or "经验不限" in t:
-                exp_count[t] += 1
     for e, c in exp_count.most_common():
         print(f"  {e:<15} {c}")
 
     # 3. 学历要求
     print(f"\n--- 学历要求 ---")
-    edu_count = Counter()
-    for j in jobs:
-        tags = j.get("tags", "")
-        for t in tags.split(" | "):
-            if t in ["大专", "本科", "硕士", "博士", "学历不限"]:
-                edu_count[t] += 1
     for e, c in edu_count.most_common():
         print(f"  {e:<10} {c}")
 
     # 4. 地区分布
     print(f"\n--- 地区分布 ---")
-    loc_count = Counter()
-    for j in jobs:
-        loc = j.get("location", "")
-        # Extract district
-        parts = loc.split("·")
-        if len(parts) >= 2:
-            loc_count[parts[1]] += 1
-        elif loc:
-            loc_count[loc] += 1
     for l, c in loc_count.most_common(10):
         print(f"  {l:<15} {c}")
 
     # 5. 公司分布
     print(f"\n--- 高频公司 ---")
-    company_count = Counter()
-    for j in jobs:
-        c = j.get("boss_name", "")
-        if c:
-            company_count[c] += 1
     for c, n in company_count.most_common(10):
         print(f"  {c:<25} {n} 个岗位")
 
     # 6. 详情页的技能标签（如有）
-    body_freq = Counter()
     if details:
         print(f"\n--- 技能要求频次（来自 JD 标签）---")
-        skill_freq = Counter()
-        for d in details:
-            for tag in d.get("skill_tags", []):
-                skill_freq[tag] += 1
         for s, c in skill_freq.most_common(25):
             bar = "█" * c
             print(f"  {s:<20} {c:>3}/{len(details)}  {bar}")
 
         # 7. JD 正文关键词（动态提取）
         print(f"\n--- JD 正文高频技术词 ---")
-        tech_terms = extract_tech_terms_from_jds(details, search_keyword)
-        for d in details:
-            jd_lower = d.get("jd", "").lower()
-            for term in tech_terms:
-                if term.lower() in jd_lower:
-                    body_freq[term] += 1
         for t, c in body_freq.most_common(25):
             pct = c / len(details) * 100
             bar = "█" * c
@@ -2176,9 +2493,7 @@ def analyze(list_data, details=None, search_keyword=""):
     print(f"\n--- 简历建议 ---")
     if details and body_freq:
         noise_list = {'BOSS直聘', 'boss', 'BOSS', '来自BOSS直聘', '金', '金币'}
-        top_skills = [s for s, _ in Counter(
-            tag for d in details for tag in d.get("skill_tags", [])
-        ).most_common(10)]
+        top_skills = [s for s, _ in skill_freq.most_common(10)]
         # 如果有效标签太少或都是噪音，用 JD 正文关键词代替
         valid_skills = [s for s in top_skills if len(s) >= 2 and s not in noise_list]
         if len(valid_skills) < 3:
@@ -2195,6 +2510,13 @@ def analyze(list_data, details=None, search_keyword=""):
             print(f"  学历要求主流: {top_edu}")
     else:
         print("  提示: 用 --detail 抓取 JD 详情后可获得更精准的简历建议")
+
+    # 9. 落盘 Markdown 报告（终端输出保留，方便直接看；文件方便存档/分享）
+    report_path = report_path or default_report_path()
+    report = build_markdown_report(list_data, details, search_keyword, stats=stats)
+    _atomic_write_text(report_path, report)
+    print(f"\n📄 Markdown 报告已保存: {report_path}")
+    return report_path
 
 
 def has_usable_smoke_jobs(jobs):
@@ -2280,16 +2602,15 @@ def run_check(cdp_port=DEFAULT_CDP_PORT):
         all_pass = False
     else:
         try:
-            resp = requests.get(f"http://127.0.0.1:{cdp_port}/json/version", timeout=5)
-            data = resp.json()
+            data = cdp_http_get("/json/version", cdp_port, timeout=5)
             browser = data.get("Browser", "未知")
             print(f"  ✅ 通过 — CDP 服务: {browser}")
         except (requests.ConnectionError, requests.Timeout):
             print(f"  ❌ 失败 — 无法连接 127.0.0.1:{cdp_port}")
-            print(f"     请先启动 Chrome CDP: python3 {__file__} --setup-chrome")
+            print(f"     请先启动 Chrome CDP: python {__file__} --setup-chrome")
             all_pass = False
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"  ❌ 失败 — CDP 响应异常: {e}")
+        except CDPUnavailableError as e:
+            print(f"  ❌ 失败 — {e}")
             all_pass = False
 
     # 检查 3: BOSS直聘登录状态
@@ -2366,8 +2687,7 @@ def prepare_cdp_profile(copy_login_state=False, reset=False, source_profile=None
 
 def is_cdp_ready(cdp_port):
     try:
-        resp = requests.get(f"http://127.0.0.1:{cdp_port}/json/version", timeout=2)
-        return resp.status_code == 200
+        return cdp_http_request("/json/version", cdp_port, timeout=2).status_code == 200
     except Exception:
         return False
 
@@ -2776,7 +3096,9 @@ def main():
     p.add_argument("--detail", action="store_true", default=True, help="抓取详情页 JD（默认开启）")
     p.add_argument("--no-detail", dest="detail", action="store_false", help="不抓取详情页")
     p.add_argument("--max-details", type=int, default=None, help="最多抓几个详情")
-    p.add_argument("--analysis", action="store_true", help="输出分析报告")
+    p.add_argument("--analysis", action="store_true", help="输出分析报告（同时写一份 Markdown 到结果目录）")
+    p.add_argument("--report-output", default=None,
+                   help="Markdown 分析报告的保存路径（默认 结果目录/boss_report_<时间>.md）")
     p.add_argument("--input", default=None, help="从已有 JSON 文件读取（跳过抓取）")
     p.add_argument("--allow-dom-fallback", action="store_true",
                    help="API 无数据时允许降级 DOM 提取（薪资可能受字体反爬影响，默认关闭）")
@@ -2886,6 +3208,9 @@ def main():
                 allow_dom_fallback=args.allow_dom_fallback,
                 diff_base=args.diff_base,
             )
+        except CDPUnavailableError as e:
+            print(f"❌ {e}")
+            sys.exit(1)
         except LoginGateError as e:
             print(str(e))
             sys.exit(1)
@@ -2934,7 +3259,8 @@ def main():
         # 如果有详情文件也加载
         if not details:
             details = load_existing_details(args.input, args.detail_output)
-        analyze(list_data, details, search_keyword=args.keyword)
+        analyze(list_data, details, search_keyword=args.keyword,
+                report_path=args.report_output)
 
     # 抓取正常结束后按需收尾（仅成功路径；异常/登录失败走 sys.exit，不会触发，保留登录态）
     if args.close_chrome:

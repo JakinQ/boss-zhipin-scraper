@@ -18,6 +18,7 @@
 - 删除死代码：`FETCH_API_JS_TEMPLATE`、`build_login_probe_url`、`parse_api_jobs_eval_value`、`should_use_dom_fallback`；`CDPSession` 新增事件缓冲与 `drain_events`；测试从 92 增至 96 个
 
 ### 新增
+- `--analysis` 现在会落盘 Markdown 分析报告（默认 `结果目录/boss_report_<时间>.md`，可用 `--report-output` 指定）：市场概览（薪资分布/月薪中位数、经验、学历、地区、高频公司）、技能要求、可点击岗位清单（**岗位名跳转职位页、公司名跳转公司页**，缺公司链接时回落到职位链接，无链接则保持纯文本）与简历建议。统计口径抽取为 `compute_analysis_stats`，终端报告与 Markdown 报告共用同一份计数，避免两处数字打架；`--input ... --analysis --no-detail` 可直接用已有数据补报告，不启动 Chrome
 - 抓取结果跨轮对比，标记本次新增岗位（#88）：输出 JSON/CSV 中每条岗位新增 `is_new` 布尔字段（终端列表同步以 🆕 标记），表示「该岗位不在历史基准中」。基准自动选取规则：同关键词+同城市、**文件名日期早于本轮**的最近一份结果（同一天多轮抓取折叠为一轮，避免和几分钟前的自己 diff 出翻页抖动噪音）；找不到同关键词历史基准时全体视为新增并在终端明示；`--diff-base <path>` 可显式指定基准文件。纯本地后处理，零额外请求。（#50 反馈的「搜索结果重复」由此缓解）
 
 - macOS 的 `--setup-chrome` 新增 Chromium 自动探测：未安装 Google Chrome 但存在 `/Applications/Chromium.app` 时，自动启动 Chromium；`--copy-login-state` 也会使用与所选浏览器匹配的 profile 目录。（#46）
@@ -26,6 +27,8 @@
 - 城市码表外置为 `data/city_codes.json`（全量 300+ 城市，覆盖一二三四五线），新增 `--list-cities [关键词]` 命令查看支持的城市；`resolve_city` 查询链改为「本地静态码表 → 运行时拉 BOSS 接口 → 9 位裸码兜底」。城市码表打进 wheel，`pip install` 用户也可用。（#24）
 
 ### 修复
+- 本机 CDP 请求强制绕开系统代理：环境里存在 `http_proxy`/`HTTP_PROXY`（Clash、公司代理、容器网络等）时，`requests` 会把发往 `127.0.0.1:9222` 的请求也交给代理，代理返回 502 纯文本后 `resp.json()` 抛 `JSONDecodeError`，报错内容与真实原因（Chrome 未启动）毫无关系。新增 `cdp_http_request` / `cdp_http_get`，统一使用 `trust_env=False` 的独立 Session；CDP 连不上时改为输出「先跑 `--setup-chrome`」这类可操作提示，不再抛 traceback
+- 详情页建页失败不再让整轮抓取崩掉：Chrome 偶发对 `Target.createTarget` 返回 `Failed to open a new tab` 并随即关闭浏览器级 WebSocket，原先 `create_page_session` 直接取 `["result"]` 抛 `KeyError` 裸崩。新增 `open_detail_page`（换新连接重试 3 次，同一连接重试无意义因 socket 已关闭），仍失败则提前结束详情、保留已抓详情与列表结果，`--analysis` 继续执行；`create_page_session` 对 CDP 错误响应给出可读错误
 - `--setup-chrome` 登录等待遇 CDP 传输层超时不再裸崩（#78）：`TimeoutError` 是 `OSError` 子类而非 `RuntimeError` 子类，`wait_for_login` 探测循环原只捕 `RuntimeError`，事件洪流冲掉命令响应时整个命令带着 traceback 退出、已写好的瞬态重试（`LOGIN_PROBE_MAX_TRANSIENT_ERRORS`）无法运行。现收敛共享元组 `CDP_TRANSIENT_EXCEPTIONS`（`(TimeoutError, websocket.WebSocketException)`），`wait_for_login` 捕获后按瞬态错误计入重试计数，`scrape_list` 外层同步补齐；同时把 `capture.enable()` 移入 `scrape_list` 的 try 块（原先位于 try 外，任何异常都会裸崩且跳过 finally 清理）。`--check` / `--smoke-test` 行为不变（原本已正确）
 - Windows 兼容：`main()` 入口将 stdout/stderr 重配为 UTF-8，修复 Windows GBK 控制台遇到 emoji（✅❌⚠️ 等）输出直接 `UnicodeEncodeError` 崩溃的问题（实测此前 73 个单测中 8 个因此失败）
 - JSON 落盘改为原子写入（临时文件 + `os.replace`）：进程中断不再留下半截 JSON 覆盖旧数据；`flush_jobs`、详情页写入与 `--merge` 详情落盘统一走 `_atomic_write_json`
